@@ -20,4 +20,7 @@ services:
     startCommand: python main.py
 
 databases:
-  - name: daily
+  - name: dailymotion-bot-db
+    databaseName: dailymotion_bot
+    user: bot_user
+    plan: starter
