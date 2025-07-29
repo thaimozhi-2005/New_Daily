@@ -1,27 +1,25 @@
 services:
-- type: background
-  name: dailymotion-upload-bot
-  env: python
-  buildCommand: "pip install -r requirements.txt"
-  startCommand: "python dailymotion_bot.py"
-  envVars:
-    - key: API_ID
-      fromDatabase:
-        name: dailymotion-bot-db
-        type: p
-        property: api-id
-    - key: API_HASH
-      fromDatabase:
-        name: dailymotion-bot-db
-        type: p
-        property: api-hash
-    - key: BOT_TOKEN
-      fromDatabase:
-        name: dailymotion-bot-db
-        type: p
-        property: bot-token
-    - key: DATABASE_URL
-      fromDatabase:
-        name: dailymotion-bot-db
-        type: p
-        property: connection
+  - type: web
+    name: dailymotion-telegram-bot
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: TELEGRAM_API_ID
+        sync: false
+      - key: TELEGRAM_API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: dailymotion-bot-db
+          property: connectionString
+
+databases:
+  - name: dailymotion-bot-db
+    databaseName: dailymotion_bot
+    user: bot_user
+    plan: free
