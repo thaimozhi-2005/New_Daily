@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: dailymotion-telegram-bot
+    env: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: DATABASE_URL
+        fromDatabase:
+          name: dailymotion-bot-db
+          property: connectionString
+    healthCheckPath: /
+    buildCommand: docker build -t dailymotion-bot .
+    startCommand: python main.py
+
+databases:
+  - name: daily
