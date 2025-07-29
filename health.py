@@ -1,63 +1,29 @@
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
-import json
-import os
-import psycopg2
+import asyncio
+from aiohttp import web
+import logging
 
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == '/health':
-            try:
-                # Check database connection
-                conn = psycopg2.connect(os.getenv("DATABASE_URL"))
-                cursor = conn.cursor()
-                cursor.execute("SELECT 1")
-                cursor.close()
-                conn.close()
-                
-                # Return healthy status
-                self.send_response(200)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                response = {
-                    "status": "healthy",
-                    "database": "connected",
-                    "service": "dailymotion-telegram-bot"
-                }
-                self.wfile.write(json.dumps(response).encode())
-                
-            except Exception as e:
-                # Return unhealthy status
-                self.send_response(503)
-                self.send_header('Content-type', 'application/json')
-                self.end_headers()
-                response = {
-                    "status": "unhealthy",
-                    "error": str(e),
-                    "service": "dailymotion-telegram-bot"
-                }
-                self.wfile.write(json.dumps(response).encode())
-        else:
-            # Default response
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            response = {
-                "service": "dailymotion-telegram-bot",
-                "status": "running"
-            }
-            self.wfile.write(json.dumps(response).encode())
-    
-    def log_message(self, format, *args):
-        # Suppress default logging
-        pass
+logger = logging.getLogger(__name__)
 
-def start_health_server():
-    """Start health check server in a separate thread"""
-    port = int(os.getenv('PORT', 8080))
-    server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
-    server_thread = threading.Thread(target=server.serve_forever)
-    server_thread.daemon = True
-    server_thread.start()
-    print(f"Health check server started on port {port}")
-    return server
+async def health_check(request):
+    """Health check endpoint for Render"""
+    return web.json_response({"status": "healthy", "service": "dailymotion-telegram-bot"})
+
+async def start_health_server():
+    """Start health check server"""
+    try:
+        app = web.Application()
+        app.router.add_get('/health', health_check)
+        app.router.add_get('/', health_check)
+        
+        port = int(os.getenv('PORT', 8000))
+        runner = web.AppRunner(app)
+        await runner.setup()
+        
+        site = web.TCPSite(runner, '0.0.0.0', port)
+        await site.start()
+        
+        logger.info(f"Health server started on port {port}")
+        return runner
+    except Exception as e:
+        logger.error(f"Health server error: {e}")
+        return None
