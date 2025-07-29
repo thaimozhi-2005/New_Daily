@@ -10,12 +10,14 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, 
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import requests
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote
 import tempfile
 import sys
 import signal
 import traceback
-from health import start_health_server
+import json
+import mimetypes
+from pathlib import Path
 
 # Setup enhanced logging
 logging.basicConfig(
@@ -36,9 +38,6 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Initialize bot
 app = Client("dailymotion_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-# Global health server reference
-health_server = None
 
 # Database connection with retry logic
 def get_db_connection(max_retries=3):
@@ -70,7 +69,9 @@ def init_db():
                     api_secret VARCHAR(255) NOT NULL,
                     username VARCHAR(255) NOT NULL,
                     password VARCHAR(255) NOT NULL,
-                    access_token VARCHAR(500),
+                    access_token TEXT,
+                    refresh_token TEXT,
+                    token_expires_at TIMESTAMP,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(user_id, channel_name)
                 )
@@ -97,13 +98,19 @@ def validate_video_file(file_path):
         if file_size == 0:
             return False, "File is empty"
         
-        if file_size > 2 * 1024 * 1024 * 1024:  # 2GB
-            return False, "File too large (max 2GB)"
+        # Dailymotion Partner API supports up to 4GB files
+        if file_size > 4 * 1024 * 1024 * 1024:  # 4GB
+            return False, "File too large (max 4GB for Partner accounts)"
         
-        valid_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm']
+        valid_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp']
         file_ext = os.path.splitext(file_path)[1].lower()
         if file_ext not in valid_extensions:
             return False, f"Unsupported format: {file_ext}"
+        
+        # Check MIME type
+        mime_type, _ = mimetypes.guess_type(file_path)
+        if mime_type and not mime_type.startswith('video/'):
+            return False, f"Invalid MIME type: {mime_type}"
         
         return True, "Valid"
         
@@ -117,14 +124,27 @@ class DailymotionUploader:
         self.username = username
         self.password = password
         self.access_token = None
-        self.base_url = "https://partner.api.dailymotion.com"  # Partner API endpoint
+        self.refresh_token = None
+        # Use the correct Dailymotion API base URL
+        self.base_url = "https://www.dailymotion.com"
+        self.api_url = "https://www.dailymotion.com/api"
         self.session = None
     
     async def get_session(self):
         if self.session is None or self.session.closed:
-            timeout = aiohttp.ClientTimeout(total=600, connect=60)
-            connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300)
-            self.session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+            timeout = aiohttp.ClientTimeout(total=900, connect=60)  # 15 minute timeout for uploads
+            connector = aiohttp.TCPConnector(limit=10, ttl_dns_cache=300, limit_per_host=5)
+            headers = {
+                'User-Agent': 'Dailymotion-Upload-Bot/1.0',
+                'Accept': 'application/json',
+                'Accept-Encoding': 'gzip, deflate'
+            }
+            self.session = aiohttp.ClientSession(
+                timeout=timeout, 
+                connector=connector,
+                headers=headers,
+                trust_env=True
+            )
         return self.session
     
     async def close_session(self):
@@ -132,230 +152,278 @@ class DailymotionUploader:
             await self.session.close()
     
     async def authenticate(self):
-        """Authenticate with Dailymotion Partner API"""
+        """Authenticate with Dailymotion API using OAuth2 password grant"""
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                logger.info(f"Partner API authentication attempt {attempt + 1}/{max_retries}")
+                logger.info(f"Dailymotion authentication attempt {attempt + 1}/{max_retries}")
                 
-                auth_url = f"{self.base_url}/oauth/v2/token"  # Partner API OAuth endpoint
-                data = {
+                # OAuth2 endpoint for password grant
+                auth_url = f"{self.base_url}/oauth/token"
+                
+                # Prepare authentication data
+                auth_data = {
                     'grant_type': 'password',
                     'client_id': self.api_key,
                     'client_secret': self.api_secret,
                     'username': self.username,
                     'password': self.password,
-                    'scope': 'manage_videos manage_channels'  # Partner-specific scopes
+                    'scope': 'manage_videos'  # Required scope for video uploads
                 }
                 
                 session = await self.get_session()
-                async with session.post(auth_url, data=data) as response:
+                
+                # Send authentication request
+                async with session.post(auth_url, data=auth_data) as response:
                     response_text = await response.text()
                     logger.info(f"Auth response status: {response.status}")
-                    logger.info(f"Auth response: {response_text[:500]}...")
                     
                     if response.status == 200:
-                        result = await response.json()
-                        self.access_token = result.get('access_token')
-                        if self.access_token:
-                            logger.info("Partner API authentication successful")
-                            return True
-                        else:
-                            logger.error("No access token in Partner API response")
+                        try:
+                            result = await response.json()
+                            self.access_token = result.get('access_token')
+                            self.refresh_token = result.get('refresh_token')
+                            
+                            if self.access_token:
+                                logger.info("Dailymotion authentication successful")
+                                return True
+                            else:
+                                logger.error("No access token in authentication response")
+                                logger.error(f"Response: {response_text}")
+                        except json.JSONDecodeError as e:
+                            logger.error(f"Failed to parse auth response JSON: {e}")
+                            logger.error(f"Response text: {response_text}")
                     else:
-                        logger.error(f"Partner API authentication failed: {response.status} - {response_text}")
+                        logger.error(f"Authentication failed: {response.status}")
+                        logger.error(f"Response: {response_text}")
                         
+                        # Handle specific error cases
                         if response.status == 400:
-                            logger.error("Bad request - check API key/secret format")
+                            try:
+                                error_data = await response.json()
+                                error_type = error_data.get('error', 'unknown')
+                                if error_type == 'invalid_client':
+                                    logger.error("Invalid API credentials - check your API key and secret")
+                                elif error_type == 'invalid_grant':
+                                    logger.error("Invalid username/password combination")
+                                else:
+                                    logger.error(f"Authentication error: {error_type}")
+                            except:
+                                logger.error("Bad request - check all credentials")
                         elif response.status == 401:
-                            logger.error("Unauthorized - invalid username/password")
+                            logger.error("Unauthorized - invalid credentials")
                         elif response.status == 403:
-                            logger.error("Forbidden - account may be restricted or not a Partner Account")
+                            logger.error("Forbidden - account may not have API access or is suspended")
                         elif response.status >= 500:
-                            logger.error("Server error - Partner API service issue")
+                            logger.error("Dailymotion server error - try again later")
                         
                         if attempt < max_retries - 1:
                             await asyncio.sleep(2 ** attempt)
                         
             except asyncio.TimeoutError:
-                logger.error(f"Partner API authentication timeout (attempt {attempt + 1})")
+                logger.error(f"Authentication timeout (attempt {attempt + 1})")
                 if attempt < max_retries - 1:
                     await asyncio.sleep(2 ** attempt)
             except Exception as e:
-                logger.error(f"Partner API authentication error (attempt {attempt + 1}): {e}")
+                logger.error(f"Authentication error (attempt {attempt + 1}): {e}")
                 if attempt < max_retries - 1:
                     await asyncio.sleep(2 ** attempt)
         
         return False
     
-    async def upload_video(self, file_path, title, description="", tags="", progress_callback=None):
-        """Upload video to Dailymotion Partner API"""
-        try:
-            logger.info(f"Starting upload for file: {file_path}")
-            logger.info(f"File size: {os.path.getsize(file_path)} bytes")
+    async def get_upload_url(self):
+        """Get upload URL from Dailymotion"""
+        if not self.access_token:
+            logger.error("No access token available")
+            return None
             
-            # Validate file
+        try:
+            upload_url_endpoint = f"{self.api_url}/file/upload"
+            params = {'access_token': self.access_token}
+            
+            session = await self.get_session()
+            
+            async with session.get(upload_url_endpoint, params=params) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    upload_url = data.get('upload_url')
+                    if upload_url:
+                        logger.info("Successfully obtained upload URL")
+                        return upload_url
+                    else:
+                        logger.error("No upload URL in response")
+                        return None
+                elif response.status == 401:
+                    logger.error("Token expired or invalid")
+                    return None
+                else:
+                    response_text = await response.text()
+                    logger.error(f"Failed to get upload URL: {response.status} - {response_text}")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"Error getting upload URL: {e}")
+            return None
+    
+    async def upload_file_to_url(self, file_path, upload_url, progress_callback=None):
+        """Upload file to the provided upload URL"""
+        try:
+            file_size = os.path.getsize(file_path)
+            logger.info(f"Uploading file: {file_path} (size: {file_size} bytes)")
+            
+            if progress_callback:
+                await progress_callback(10)
+            
+            session = await self.get_session()
+            
+            # Read file and prepare for upload
+            async with aiofiles.open(file_path, 'rb') as file:
+                file_content = await file.read()
+                
+                if progress_callback:
+                    await progress_callback(30)
+                
+                # Prepare multipart form data
+                data = aiohttp.FormData()
+                filename = os.path.basename(file_path)
+                mime_type = mimetypes.guess_type(file_path)[0] or 'video/mp4'
+                
+                data.add_field('file', 
+                             file_content, 
+                             filename=filename,
+                             content_type=mime_type)
+                
+                if progress_callback:
+                    await progress_callback(50)
+                
+                # Upload file
+                async with session.post(upload_url, data=data) as response:
+                    if response.status == 200:
+                        result = await response.json()
+                        file_url = result.get('url')
+                        if file_url:
+                            logger.info("File uploaded successfully")
+                            if progress_callback:
+                                await progress_callback(80)
+                            return file_url
+                        else:
+                            logger.error("No file URL in upload response")
+                            return None
+                    else:
+                        response_text = await response.text()
+                        logger.error(f"File upload failed: {response.status} - {response_text}")
+                        return None
+                        
+        except Exception as e:
+            logger.error(f"File upload error: {e}")
+            return None
+    
+    async def create_video(self, file_url, title, description="", tags="", progress_callback=None):
+        """Create video entry on Dailymotion"""
+        try:
+            if not self.access_token:
+                logger.error("No access token for video creation")
+                return None
+            
+            create_url = f"{self.api_url}/videos"
+            
+            # Prepare video data
+            video_data = {
+                'access_token': self.access_token,
+                'url': file_url,
+                'title': title[:150],  # Dailymotion title limit
+                'description': description[:2000] if description else "",  # Description limit
+                'tags': tags[:500] if tags else "",  # Tags limit
+                'published': 'true',  # Make video public
+                'private': 'false'
+            }
+            
+            session = await self.get_session()
+            
+            async with session.post(create_url, data=video_data) as response:
+                if response.status == 200:
+                    result = await response.json()
+                    video_id = result.get('id')
+                    if video_id:
+                        video_url = f"https://www.dailymotion.com/video/{video_id}"
+                        logger.info(f"Video created successfully: {video_url}")
+                        if progress_callback:
+                            await progress_callback(100)
+                        return video_url
+                    else:
+                        logger.error("No video ID in creation response")
+                        return None
+                elif response.status == 401:
+                    logger.error("Token expired during video creation")
+                    return None
+                else:
+                    response_text = await response.text()
+                    logger.error(f"Video creation failed: {response.status} - {response_text}")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"Video creation error: {e}")
+            return None
+    
+    async def upload_video(self, file_path, title, description="", tags="", progress_callback=None):
+        """Complete video upload process"""
+        try:
+            logger.info(f"Starting complete upload process for: {file_path}")
+            
+            # Step 1: Validate file
             is_valid, validation_msg = validate_video_file(file_path)
             if not is_valid:
                 logger.error(f"File validation failed: {validation_msg}")
                 return None
             
+            if progress_callback:
+                await progress_callback(5)
+            
+            # Step 2: Authenticate if needed
             if not self.access_token:
-                logger.info("No access token, authenticating with Partner API...")
+                logger.info("Authenticating with Dailymotion...")
                 if not await self.authenticate():
-                    logger.error("Partner API authentication failed, cannot upload")
-                    return None
-            
-            # Step 1: Get upload URL
-            logger.info("Step 1: Getting Partner API upload URL")
-            upload_url_endpoint = f"{self.base_url}/file/upload"
-            params = {'access_token': self.access_token}
-            
-            session = await self.get_session()
-            
-            upload_url = None
-            for attempt in range(3):
-                try:
-                    logger.info(f"Upload URL attempt {attempt + 1}")
-                    async with session.get(upload_url_endpoint, params=params) as response:
-                        response_text = await response.text()
-                        logger.info(f"Upload URL response status: {response.status}")
-                        
-                        if response.status == 200:
-                            upload_data = await response.json()
-                            upload_url = upload_data.get('upload_url')
-                            if upload_url:
-                                logger.info(f"Got Partner API upload URL successfully")
-                                break
-                            else:
-                                logger.error("No upload URL in Partner API response")
-                        elif response.status == 401:
-                            logger.info("Partner API token expired, re-authenticating...")
-                            if await self.authenticate():
-                                params['access_token'] = self.access_token
-                                continue
-                            else:
-                                logger.error("Partner API re-authentication failed")
-                                return None
-                        else:
-                            logger.error(f"Failed to get Partner API upload URL: {response.status} - {response_text}")
-                            
-                except Exception as e:
-                    logger.error(f"Partner API upload URL request error: {e}")
-                
-                if attempt < 2:
-                    await asyncio.sleep(2 ** attempt)
-            
-            if not upload_url:
-                logger.error("Could not get Partner API upload URL after all attempts")
-                return None
-            
-            # Step 2: Upload file
-            logger.info("Step 2: Uploading file to Partner API")
-            file_size = os.path.getsize(file_path)
-            
-            async with aiofiles.open(file_path, 'rb') as file:
-                file_content = await file.read()
-                logger.info(f"Read {len(file_content)} bytes from file")
-                
-                if progress_callback:
-                    await progress_callback(25)
-                
-                file_url = None
-                for attempt in range(3):
-                    try:
-                        logger.info(f"Partner API file upload attempt {attempt + 1}")
-                        
-                        data = aiohttp.FormData()
-                        data.add_field('file', file_content, 
-                                     filename=os.path.basename(file_path),
-                                     content_type='video/mp4')
-                        
-                        if progress_callback:
-                            await progress_callback(50)
-                        
-                        async with session.post(upload_url, data=data) as response:
-                            response_text = await response.text()
-                            logger.info(f"Partner API file upload response status: {response.status}")
-                            
-                            if response.status == 200:
-                                upload_result = await response.json()
-                                file_url = upload_result.get('url')
-                                if file_url:
-                                    logger.info(f"File uploaded successfully to Partner API")
-                                    break
-                                else:
-                                    logger.error("No file URL in Partner API upload response")
-                            else:
-                                logger.error(f"Partner API file upload failed: {response.status} - {response_text}")
-                                
-                    except Exception as e:
-                        logger.error(f"Partner API file upload error: {e}")
-                        
-                    if attempt < 2:
-                        await asyncio.sleep(2 ** attempt)
-                
-                if not file_url:
-                    logger.error("Partner API file upload failed after all attempts")
+                    logger.error("Authentication failed")
                     return None
             
             if progress_callback:
-                await progress_callback(75)
+                await progress_callback(15)
             
-            # Step 3: Create video
-            logger.info("Step 3: Creating video entry in Partner API")
-            create_url = f"{self.base_url}/videos"  # Partner API video creation endpoint
-            video_data = {
-                'access_token': self.access_token,
-                'url': file_url,
-                'title': title,
-                'description': description,
-                'tags': tags,
-                'is_public': 'true'  # Partner API uses is_public instead of published
-            }
+            # Step 3: Get upload URL
+            logger.info("Getting upload URL...")
+            upload_url = await self.get_upload_url()
+            if not upload_url:
+                logger.error("Failed to get upload URL")
+                return None
             
-            for attempt in range(3):
-                try:
-                    logger.info(f"Partner API video creation attempt {attempt + 1}")
-                    async with session.post(create_url, data=video_data) as response:
-                        response_text = await response.text()
-                        logger.info(f"Partner API video creation response status: {response.status}")
-                        
-                        if response.status == 200:
-                            result = await response.json()
-                            video_id = result.get('id')
-                            if video_id:
-                                video_url = f"https://www.dailymotion.com/video/{video_id}"
-                                logger.info(f"Video created successfully: {video_url}")
-                                
-                                if progress_callback:
-                                    await progress_callback(100)
-                                
-                                return video_url
-                            else:
-                                logger.error("No video ID in Partner API creation response")
-                        elif response.status == 401:
-                            logger.info("Partner API token expired during video creation")
-                            if await self.authenticate():
-                                video_data['access_token'] = self.access_token
-                                continue
-                            else:
-                                logger.error("Partner API re-authentication failed during video creation")
-                                return None
-                        else:
-                            logger.error(f"Partner API video creation failed: {response.status} - {response_text}")
-                            
-                except Exception as e:
-                    logger.error(f"Partner API video creation error: {e}")
+            if progress_callback:
+                await progress_callback(20)
+            
+            # Step 4: Upload file
+            logger.info("Uploading file...")
+            file_url = await self.upload_file_to_url(file_path, upload_url, 
+                                                   lambda p: progress_callback(20 + p * 0.6) if progress_callback else None)
+            if not file_url:
+                logger.error("File upload failed")
+                return None
+            
+            if progress_callback:
+                await progress_callback(85)
+            
+            # Step 5: Create video entry
+            logger.info("Creating video entry...")
+            video_url = await self.create_video(file_url, title, description, tags,
+                                              lambda p: progress_callback(85 + p * 0.15) if progress_callback else None)
+            
+            if video_url:
+                logger.info(f"Complete upload process successful: {video_url}")
+                return video_url
+            else:
+                logger.error("Video creation failed")
+                return None
                 
-                if attempt < 2:
-                    await asyncio.sleep(2 ** attempt)
-            
-            logger.error("Partner API video creation failed after all attempts")
-            return None
-                    
         except Exception as e:
-            logger.error(f"Partner API upload error: {e}")
+            logger.error(f"Complete upload process error: {e}")
             logger.error(f"Traceback: {traceback.format_exc()}")
             return None
         finally:
@@ -364,6 +432,13 @@ class DailymotionUploader:
 async def get_upload_error_details(uploader, file_path):
     """Get detailed error information for troubleshooting"""
     details = []
+    
+    # Test file validation
+    is_valid, msg = validate_video_file(file_path)
+    if not is_valid:
+        details.append(f"❌ File validation: {msg}")
+    else:
+        details.append("✅ File validation passed")
     
     # Test authentication
     try:
@@ -374,21 +449,15 @@ async def get_upload_error_details(uploader, file_path):
     except Exception as e:
         details.append(f"❌ Authentication error: {str(e)[:100]}")
     
-    # Test file
-    is_valid, msg = validate_video_file(file_path)
-    if not is_valid:
-        details.append(f"❌ File validation: {msg}")
-    else:
-        details.append("✅ File validation passed")
-    
-    # Test network connectivity
+    # Test API connectivity
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get("https://partner.api.dailymotion.com/", timeout=aiohttp.ClientTimeout(total=10)) as response:
-                if response.status == 200:
-                    details.append("✅ Dailymotion Partner API accessible")
+            async with session.get("https://www.dailymotion.com/api", 
+                                 timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status in [200, 404]:  # 404 is normal for API root
+                    details.append("✅ Dailymotion API accessible")
                 else:
-                    details.append(f"❌ Dailymotion Partner API error: {response.status}")
+                    details.append(f"❌ Dailymotion API error: {response.status}")
     except asyncio.TimeoutError:
         details.append("❌ Network timeout - check internet connection")
     except Exception as e:
@@ -408,7 +477,7 @@ I'm here to help you upload videos directly to your Dailymotion accounts with ea
 
 **What I can do:**
 ✅ Upload videos to multiple Dailymotion accounts
-✅ Handle large video files efficiently  
+✅ Handle large video files (up to 4GB for Partner accounts)
 ✅ Show upload progress in real-time
 ✅ Manage multiple Dailymotion channels
 ✅ Robust error handling and recovery
@@ -422,6 +491,11 @@ I'm here to help you upload videos directly to your Dailymotion accounts with ea
 **Debug Commands:**
 🔧 /testauth - Test Dailymotion authentication
 🔧 /testapi - Test API connectivity
+
+**Requirements:**
+• Dailymotion account with API access
+• API Key & Secret from Dailymotion Developer Portal
+• Valid username & password
 
 Let's get started! 🚀
     """
@@ -444,6 +518,12 @@ async def help_command(client, message: Message):
 🔧 `/testauth` - Test your Dailymotion credentials
 🔧 `/testapi` - Test API connectivity
 
+**How to get API Credentials:**
+1. Go to https://developers.dailymotion.com
+2. Create a new application
+3. Get your API Key (Client ID) and Secret (Client Secret)
+4. Use your regular Dailymotion username/password
+
 **How to upload videos:**
 1. First, add your Dailymotion account credentials using `/addchannel`
 2. Use `/upload` command
@@ -452,24 +532,18 @@ async def help_command(client, message: Message):
 5. Wait for the upload to complete
 
 **Supported Formats:**
-📹 MP4, AVI, MOV, MKV, WMV, FLV, WEBM
-📏 Maximum file size: 2GB
+📹 MP4, AVI, MOV, MKV, WMV, FLV, WEBM, M4V, 3GP
+📏 Maximum file size: 4GB (Partner accounts)
 ⏱️ Upload time depends on file size and internet speed
-
-**Getting API Credentials:**
-1. Go to https://partner.api.dailymotion.com
-2. Log in to your Partner Dashboard
-3. Register your application
-4. Get your API Key and Secret
-5. Use your Dailymotion Partner username/password
 
 **Troubleshooting:**
 If uploads fail, try:
 • Check credentials with /testauth
 • Test connectivity with /testapi
+• Verify your Dailymotion account has API access
 • Try smaller files first
 • Check your internet connection
-• Verify Dailymotion Partner account is active
+• Make sure your API application is approved
 
 Need more help? Use the debug commands to diagnose issues!
     """
@@ -498,7 +572,12 @@ async def test_auth_command(client, message: Message):
         if not channels:
             await testing_msg.edit_text(
                 "❌ **No channels found!**\n\n"
-                "Add a channel first using /addchannel"
+                "Add a channel first using /addchannel\n\n"
+                "📋 **Setup Steps:**\n"
+                "1. Go to https://developers.dailymotion.com\n"
+                "2. Create an application\n"
+                "3. Get API Key & Secret\n"
+                "4. Use /addchannel with your credentials"
             )
             return
         
@@ -522,7 +601,13 @@ async def test_auth_command(client, message: Message):
                 results.append(f"⚠️ **{channel['channel_name']}** - Error: {str(e)[:50]}")
         
         result_text = "🔍 **Authentication Test Results:**\n\n" + "\n".join(results)
-        result_text += "\n\n💡 If any channel failed, check credentials or try /testapi"
+        
+        if any("❌" in result for result in results):
+            result_text += "\n\n💡 **If any channel failed:**\n"
+            result_text += "• Verify API Key & Secret are correct\n"
+            result_text += "• Check username/password\n"
+            result_text += "• Ensure API application is approved\n"
+            result_text += "• Try /testapi for connectivity issues"
         
         await testing_msg.edit_text(result_text)
         
@@ -533,37 +618,50 @@ async def test_auth_command(client, message: Message):
 # Debug command to test API connectivity
 @app.on_message(filters.command("testapi"))
 async def test_api_command(client, message: Message):
-    """Test Dailymotion Partner API connectivity"""
-    testing_msg = await message.reply_text("🌐 **Testing API Connectivity...**\n\nChecking Dailymotion Partner API access...")
+    """Test Dailymotion API connectivity"""
+    testing_msg = await message.reply_text("🌐 **Testing API Connectivity...**\n\nChecking Dailymotion API access...")
     
     try:
         # Test basic API connectivity
         async with aiohttp.ClientSession() as session:
             start_time = asyncio.get_event_loop().time()
-            async with session.get("https://partner.api.dailymotion.com/", timeout=aiohttp.ClientTimeout(total=10)) as response:
+            
+            # Test main API endpoint
+            async with session.get("https://www.dailymotion.com/api", 
+                                 timeout=aiohttp.ClientTimeout(total=10)) as response:
                 end_time = asyncio.get_event_loop().time()
                 response_time = int((end_time - start_time) * 1000)
                 
-                status = response.status
+                # Test OAuth endpoint
+                oauth_start = asyncio.get_event_loop().time()
+                async with session.get("https://www.dailymotion.com/oauth", 
+                                     timeout=aiohttp.ClientTimeout(total=10)) as oauth_response:
+                    oauth_end = asyncio.get_event_loop().time()
+                    oauth_time = int((oauth_end - oauth_start) * 1000)
                 
-                if status == 200:
-                    result_text = (
-                        f"✅ **API Connectivity Test Passed!**\n\n"
-                        f"🌐 **Endpoint:** https://partner.api.dailymotion.com/\n"
-                        f"📊 **Status Code:** {status}\n"
-                        f"⏱️ **Response Time:** {response_time}ms\n\n"
-                        f"🔗 **Network:** Working properly\n"
-                        f"🛡️ **SSL/HTTPS:** Verified\n\n"
-                        f"If uploads still fail, the issue is likely with credentials or file format."
-                    )
+                result_text = (
+                    f"✅ **API Connectivity Test Results:**\n\n"
+                    f"🌐 **Main API Endpoint:**\n"
+                    f"   URL: https://www.dailymotion.com/api\n"
+                    f"   Status: {response.status}\n"
+                    f"   Response Time: {response_time}ms\n\n"
+                    f"🔐 **OAuth Endpoint:**\n"
+                    f"   URL: https://www.dailymotion.com/oauth\n"
+                    f"   Status: {oauth_response.status}\n"
+                    f"   Response Time: {oauth_time}ms\n\n"
+                    f"🔗 **Network Status:** Working\n"
+                    f"🛡️ **SSL/HTTPS:** Verified\n\n"
+                )
+                
+                if response.status in [200, 404] and oauth_response.status in [200, 404]:
+                    result_text += "✅ **All endpoints are accessible!**\n\n"
+                    result_text += "If uploads still fail, check:\n"
+                    result_text += "• API credentials (/testauth)\n"
+                    result_text += "• File format and size\n"
+                    result_text += "• Account permissions on Dailymotion"
                 else:
-                    result_text = (
-                        f"⚠️ **API Connectivity Issues**\n\n"
-                        f"🌐 **Endpoint:** https://partner.api.dailymotion.com/\n"
-                        f"📊 **Status Code:** {status}\n"
-                        f"⏱️ **Response Time:** {response_time}ms\n\n"
-                        f"The Partner API is reachable but returned an unexpected status code."
-                    )
+                    result_text += "⚠️ **Some endpoints returned unexpected status codes**\n"
+                    result_text += "This might indicate temporary Dailymotion API issues."
                 
         await testing_msg.edit_text(result_text)
         
@@ -575,11 +673,12 @@ async def test_api_command(client, message: Message):
             "**Possible causes:**\n"
             "• Slow internet connection\n"
             "• Network firewall blocking access\n"
-            "• Dailymotion Partner API temporarily down\n"
-            "• ISP blocking Dailymotion\n\n"
+            "• Dailymotion API temporarily down\n"
+            "• ISP or country blocking Dailymotion\n\n"
             "**Solutions:**\n"
             "• Check your internet connection\n"
             "• Try again in a few minutes\n"
+            "• Use VPN if Dailymotion is blocked\n"
             "• Contact your network administrator"
         )
     except Exception as e:
@@ -587,7 +686,11 @@ async def test_api_command(client, message: Message):
             f"❌ **API Connectivity Test Failed!**\n\n"
             f"🌐 **Error:** {str(e)[:200]}\n\n"
             f"**This indicates a network connectivity issue.**\n"
-            f"Please check your internet connection and try again."
+            f"Please check your internet connection and try again.\n\n"
+            f"**If using a VPS/Server:**\n"
+            f"• Check DNS settings\n"
+            f"• Verify outbound connections are allowed\n"
+            f"• Test from a different network"
         )
 
 @app.on_message(filters.command("addchannel"))
@@ -598,6 +701,10 @@ async def add_channel_command(client, message: Message):
     await message.reply_text(
         "📺 **Add New Dailymotion Channel**\n\n"
         "Let's add your Dailymotion account step by step.\n\n"
+        "**Before starting, make sure you have:**\n"
+        "• A Dailymotion account\n"
+        "• API Key & Secret from https://developers.dailymotion.com\n"
+        "• Your Dailymotion username & password\n\n"
         "**Step 1/5:** Please enter a friendly name for this channel:\n"
         "*(Example: My Main Channel, Gaming Videos, etc.)*"
     )
@@ -621,8 +728,12 @@ async def list_channels_command(client, message: Message):
         if not channels:
             await message.reply_text(
                 "📺 **No channels found!**\n\n"
-                "You haven't added any channels yet.\n"
-                "Use /addchannel to add your first Dailymotion account! 🚀"
+                "You haven't added any channels yet.\n\n"
+                "**Getting Started:**\n"
+                "1. Go to https://developers.dailymotion.com\n"
+                "2. Create an API application\n"
+                "3. Get your API Key & Secret\n"
+                "4. Use /addchannel to add your account! 🚀"
             )
             return
         
@@ -634,7 +745,7 @@ async def list_channels_command(client, message: Message):
             channel_list += f"   📅 Added: {created_date}\n\n"
         
         channel_list += (
-            "💡 **Commands:**\n"
+            "💡 **Available Commands:**\n"
             "• /upload - Upload videos to any channel\n"
             "• /testauth - Test channel authentication\n"
             "• /rmchannel - Remove a channel"
@@ -713,10 +824,12 @@ async def upload_command(client, message: Message):
             await message.reply_text(
                 "📺 **No channels found!**\n\n"
                 "You need to add at least one Dailymotion account before uploading.\n\n"
-                "🔧 **Steps to get started:**\n"
-                "1. Use /addchannel to add your Dailymotion account\n"
-                "2. Get your API credentials from https://partner.api.dailymotion.com\n"
-                "3. Come back and use /upload\n\n"
+                "🔧 **Setup Steps:**\n"
+                "1. Go to https://developers.dailymotion.com\n"
+                "2. Create a new application\n"
+                "3. Get your API Key & Secret\n"
+                "4. Use /addchannel to add your account\n"
+                "5. Come back and use /upload\n\n"
                 "🔍 **Troubleshooting:**\n"
                 "• Use /testauth to verify credentials\n"
                 "• Use /testapi to check connectivity\n"
@@ -728,14 +841,15 @@ async def upload_command(client, message: Message):
         await message.reply_text(
             "🎬 **Upload Video to Dailymotion**\n\n"
             "Please send me the video file you want to upload.\n\n"
-            "📝 **Supported formats:** MP4, AVI, MOV, MKV, WMV, FLV, WEBM\n"
-            "📏 **Maximum file size:** 2GB\n"
+            "📝 **Supported formats:** MP4, AVI, MOV, MKV, WMV, FLV, WEBM, M4V, 3GP\n"
+            "📏 **Maximum file size:** 4GB (for Partner accounts)\n"
             "⏱️ **Processing time:** Depends on file size\n\n"
             "📎 Just drag and drop your video file here!\n\n"
             "🔍 **If upload fails, try:**\n"
-            "• Smaller file (under 100MB) first\n"
+            "• Smaller file (under 500MB) first\n"
             "• /testauth to verify credentials\n"
-            "• /testapi to check connectivity"
+            "• /testapi to check connectivity\n"
+            "• Check file format is supported"
         )
         
     except Exception as e:
@@ -761,8 +875,9 @@ async def handle_text_messages(client, message: Message):
         state["data"]["channel_name"] = channel_name
         state["step"] = "api_key"
         await message.reply_text(
-            "**Step 2/5:** Please enter your Dailymotion API Key:\n\n"
-            "💡 *Get it from: https://partner.api.dailymotion.com*"
+            "**Step 2/5:** Please enter your Dailymotion API Key (Client ID):\n\n"
+            "💡 **Get it from:** https://developers.dailymotion.com\n"
+            "📋 **Location:** Your Application → API Key/Client ID"
         )
     
     elif state["step"] == "api_key":
@@ -774,7 +889,8 @@ async def handle_text_messages(client, message: Message):
         state["data"]["api_key"] = api_key
         state["step"] = "api_secret"
         await message.reply_text(
-            "**Step 3/5:** Please enter your Dailymotion API Secret:"
+            "**Step 3/5:** Please enter your Dailymotion API Secret (Client Secret):\n\n"
+            "📋 **Location:** Your Application → API Secret/Client Secret"
         )
     
     elif state["step"] == "api_secret":
@@ -786,7 +902,8 @@ async def handle_text_messages(client, message: Message):
         state["data"]["api_secret"] = api_secret
         state["step"] = "username"
         await message.reply_text(
-            "**Step 4/5:** Please enter your Dailymotion Username:"
+            "**Step 4/5:** Please enter your Dailymotion Username:\n\n"
+            "👤 **Note:** This is your regular Dailymotion login username"
         )
     
     elif state["step"] == "username":
@@ -799,7 +916,8 @@ async def handle_text_messages(client, message: Message):
         state["step"] = "password"
         await message.reply_text(
             "**Step 5/5:** Please enter your Dailymotion Password:\n\n"
-            "🔐 *Your password will be stored securely and encrypted.*"
+            "🔐 **Security:** Your password will be stored securely and encrypted.\n"
+            "🗑️ **Privacy:** This message will be deleted after processing."
         )
     
     elif state["step"] == "password":
@@ -819,7 +937,8 @@ async def handle_text_messages(client, message: Message):
         # Test credentials before saving
         testing_msg = await message.reply_text(
             "🔄 **Testing credentials...**\n\n"
-            "Please wait while I verify your Dailymotion account..."
+            "Please wait while I verify your Dailymotion account...\n"
+            "This may take up to 30 seconds."
         )
         
         # Test authentication
@@ -836,16 +955,18 @@ async def handle_text_messages(client, message: Message):
             await testing_msg.edit_text(
                 "❌ **Authentication Failed!**\n\n"
                 "Could not connect to your Dailymotion account.\n\n"
-                "**Possible issues:**\n"
+                "**Common Issues:**\n"
                 "• Incorrect username or password\n"
-                "• Invalid API key or secret\n"
+                "• Invalid API Key or Secret\n"
+                "• API application not approved by Dailymotion\n"
                 "• Account suspended or restricted\n"
-                "• Dailymotion Partner service temporarily unavailable\n\n"
+                "• API access not enabled for your account\n\n"
                 "**Solutions:**\n"
                 "• Double-check all credentials\n"
-                "• Verify account is active on Dailymotion\n"
+                "• Verify API application status at https://developers.dailymotion.com\n"
+                "• Ensure account is active on Dailymotion\n"
                 "• Try /testapi to check connectivity\n"
-                "• Use /addchannel to start over"
+                "• Use /addchannel to start over with correct credentials"
             )
             del user_states[user_id]
             return
@@ -875,12 +996,13 @@ async def handle_text_messages(client, message: Message):
                     f"✅ **Channel Added Successfully!**\n\n"
                     f"📺 **Channel:** {state['data']['channel_name']}\n"
                     f"👤 **Username:** {state['data']['username']}\n"
-                    f"🔐 **Status:** Authenticated ✅\n\n"
-                    f"🎬 You can now use /upload to upload videos to this account!\n\n"
+                    f"🔐 **Status:** Authenticated & Ready ✅\n\n"
+                    f"🎬 **You can now upload videos to this account!**\n\n"
                     f"💡 **Quick Commands:**\n"
                     f"• /upload - Upload videos\n"
                     f"• /list - View all channels\n"
-                    f"• /testauth - Test authentication"
+                    f"• /testauth - Test authentication\n\n"
+                    f"🚀 **Ready to upload? Use /upload now!**"
                 )
                 
                 del user_states[user_id]
@@ -888,14 +1010,18 @@ async def handle_text_messages(client, message: Message):
             except psycopg2.IntegrityError:
                 await testing_msg.edit_text(
                     "❌ **Channel Already Exists!**\n\n"
-                    "You already have a channel with this name.\n"
-                    "Please use a different name or remove the existing channel first."
+                    "You already have a channel with this name.\n\n"
+                    "**Options:**\n"
+                    "• Use a different channel name\n"
+                    "• Remove the existing channel with /rmchannel\n"
+                    "• Use /list to see all your channels"
                 )
             except Exception as e:
                 logger.error(f"Database save error: {e}")
                 await testing_msg.edit_text(
                     "❌ **Database Error!**\n\n"
-                    "Could not save your channel. Please try again later."
+                    "Could not save your channel. Please try again later.\n\n"
+                    f"**Error:** {str(e)[:100]}"
                 )
         else:
             await testing_msg.edit_text("❌ Database connection error. Please try again.")
@@ -921,33 +1047,36 @@ async def handle_video_upload(client, message: Message):
         await message.reply_text("❌ Please send a valid video file.")
         return
     
-    # Check file size (2GB limit)
-    max_size = 2 * 1024 * 1024 * 1024  # 2GB in bytes
+    # Check file size (4GB limit for Partner accounts)
+    max_size = 4 * 1024 * 1024 * 1024  # 4GB in bytes
     if file_info.file_size > max_size:
-        file_size_mb = file_info.file_size / (1024 * 1024)
+        file_size_gb = file_info.file_size / (1024 * 1024 * 1024)
         await message.reply_text(
             f"❌ **File too large!**\n\n"
-            f"📏 **Your file:** {file_size_mb:.1f} MB\n"
-            f"📏 **Maximum allowed:** 2048 MB (2GB)\n\n"
-            f"Please compress your video or use a smaller file.\n\n"
-            f"💡 **Tips for large files:**\n"
-            f"• Use video compression tools\n"
+            f"📏 **Your file:** {file_size_gb:.2f} GB\n"
+            f"📏 **Maximum allowed:** 4 GB\n\n"
+            f"**Solutions:**\n"
+            f"• Compress your video using tools like HandBrake\n"
             f"• Reduce video quality/resolution\n"
-            f"• Split into smaller parts"
+            f"• Split video into smaller parts\n"
+            f"• Use online compression tools"
         )
         return
     
     # Check if it's a video file
-    video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v']
-    video_mimes = ['video/mp4', 'video/avi', 'video/quicktime', 'video/x-msvideo', 'video/x-matroska']
+    video_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm', '.m4v', '.3gp', '.m2v', '.mpg', '.mpeg']
+    video_mimes = ['video/mp4', 'video/avi', 'video/quicktime', 'video/x-msvideo', 'video/x-matroska', 'video/webm']
     
     file_ext = os.path.splitext(file_name.lower())[1]
-    if file_ext not in video_extensions and mime_type not in video_mimes:
+    if file_ext not in video_extensions and not any(mime in mime_type.lower() for mime in ['video/', 'application/octet-stream']):
         await message.reply_text(
             "❌ **Invalid file type!**\n\n"
             "Please send a video file with one of these formats:\n"
-            "📹 MP4, AVI, MOV, MKV, WMV, FLV, WEBM\n\n"
-            "If this is a video file, try renaming it with the correct extension."
+            "📹 **Supported:** MP4, AVI, MOV, MKV, WMV, FLV, WEBM, M4V, 3GP\n\n"
+            "**If this is a video file:**\n"
+            "• Try renaming it with the correct extension (.mp4, .avi, etc.)\n"
+            "• Make sure the file isn't corrupted\n"
+            "• Convert it to MP4 format for best compatibility"
         )
         return
     
@@ -997,11 +1126,14 @@ async def handle_video_upload(client, message: Message):
         await message.reply_text(
             f"🎬 **Video Received Successfully!**\n\n"
             f"📁 **File:** {file_name}\n"
-            f"📏 **Size:** {file_size_mb:.1f} MB\n"
+            f"📏 **Size:** {file_size_mb:.1f} MB ({file_info.file_size:,} bytes)\n"
             f"{duration_text}\n"
             f"📺 **Select a channel to upload to:**\n\n"
-            f"⚡ *Upload will begin immediately after selection*\n\n"
-            f"🔍 *If upload fails, try /testauth first*",
+            f"⚡ **Upload will begin immediately after selection**\n\n"
+            f"🔍 **If upload fails:**\n"
+            f"• Try /testauth first\n"
+            f"• Check /testapi for connectivity\n"
+            f"• Ensure file format is supported",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         
@@ -1040,7 +1172,7 @@ async def handle_upload_callback(client, callback_query: CallbackQuery, channel_
         await callback_query.edit_message_text(
             "🔄 **Initializing Upload Process...**\n\n"
             "📋 Preparing upload environment\n"
-            "🔍 Validating credentials\n"
+            "🔍 Validating credentials and file\n"
             "⚡ This may take a moment..."
         )
         
@@ -1066,16 +1198,17 @@ async def handle_upload_callback(client, callback_query: CallbackQuery, channel_
         
         # Update progress message
         progress_message = await callback_query.edit_message_text(
-            f"⬇️ **Downloading Video...**\n\n"
+            f"⬇️ **Downloading Video from Telegram...**\n\n"
             f"📁 **File:** {file_name}\n"
             f"📺 **Channel:** {channel['channel_name']}\n"
             f"👤 **Account:** @{channel['username']}\n\n"
             f"📊 **Progress:** 0% - Starting download...\n"
-            f"🔍 **Status:** Initializing..."
+            f"🔍 **Status:** Initializing download process..."
         )
         
-        # Create temporary file
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file_name)[1])
+        # Create temporary file with proper extension
+        file_extension = os.path.splitext(file_name)[1] or '.mp4'
+        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=file_extension)
         temp_file_path = temp_file.name
         temp_file.close()
         
@@ -1089,14 +1222,30 @@ async def handle_upload_callback(client, callback_query: CallbackQuery, channel_
                 )
             )
             
+            # Verify file was downloaded correctly
+            if not os.path.exists(temp_file_path) or os.path.getsize(temp_file_path) == 0:
+                await progress_message.edit_text(
+                    "❌ **Download Failed!**\n\n"
+                    "File could not be downloaded from Telegram.\n\n"
+                    "**Possible causes:**\n"
+                    "• Network connection interrupted\n"
+                    "• Telegram server issues\n"
+                    "• File corrupted or unavailable\n\n"
+                    "**Solutions:**\n"
+                    "• Try uploading the file again\n"
+                    "• Check your internet connection\n"
+                    "• Try with a smaller file first"
+                )
+                return
+            
             # Update message for upload phase
             await progress_message.edit_text(
                 f"⬆️ **Uploading to Dailymotion...**\n\n"
                 f"📁 **File:** {file_name}\n"
                 f"📺 **Channel:** {channel['channel_name']}\n"
                 f"👤 **Account:** @{channel['username']}\n\n"
-                f"🔐 Authenticating with Dailymotion...\n"
-                f"📡 Preparing upload..."
+                f"🔐 **Status:** Connecting to Dailymotion API...\n"
+                f"📡 Preparing for upload..."
             )
             
             # Create uploader and upload
@@ -1109,14 +1258,20 @@ async def handle_upload_callback(client, callback_query: CallbackQuery, channel_
             
             # Generate title from filename
             title = os.path.splitext(file_name)[0].replace('_', ' ').replace('-', ' ').title()
+            # Clean title and ensure it's within limits
+            title = ''.join(c for c in title if c.isalnum() or c in (' ', '-', '_', '.', '(', ')', '[', ']'))
             if len(title) > 150:  # Dailymotion title limit
                 title = title[:147] + "..."
+            if not title.strip():
+                title = f"Video Upload {datetime.now().strftime('%Y-%m-%d %H:%M')}"
             
             # Create description
             description = (
-                f"Video uploaded via Telegram Bot\n"
-                f"Upload Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"Original Filename: {file_name}"
+                f"Video uploaded via Telegram Bot\n\n"
+                f"📅 Upload Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"📁 Original Filename: {file_name}\n"
+                f"📏 File Size: {file_info.file_size:,} bytes\n"
+                f"🤖 Uploaded automatically via Telegram"
             )
             
             # Upload with progress callback
@@ -1124,7 +1279,7 @@ async def handle_upload_callback(client, callback_query: CallbackQuery, channel_
                 temp_file_path,
                 title,
                 description=description,
-                tags="telegram,bot,upload",
+                tags="telegram,bot,upload,automatic",
                 progress_callback=lambda progress: asyncio.create_task(
                     update_upload_progress(progress_message, progress, file_name, channel['channel_name'])
                 )
@@ -1133,27 +1288,30 @@ async def handle_upload_callback(client, callback_query: CallbackQuery, channel_
             # Clean up temporary file
             try:
                 os.unlink(temp_file_path)
-            except:
-                pass
+            except Exception as cleanup_error:
+                logger.warning(f"Could not delete temporary file: {cleanup_error}")
             
             if video_url:
                 # Success message
-                await progress_message.edit_text(
+                success_text = (
                     f"✅ **Upload Completed Successfully!**\n\n"
                     f"📁 **File:** {file_name}\n"
                     f"🎬 **Title:** {title}\n"
                     f"📺 **Channel:** {channel['channel_name']}\n"
                     f"👤 **Account:** @{channel['username']}\n\n"
                     f"🔗 **Video URL:**\n{video_url}\n\n"
-                    f"🎉 **Your video is now live on Dailymotion!**\n"
-                    f"📊 Processing may take a few minutes for HD quality."
+                    f"🎉 **Your video is now live on Dailymotion!**\n\n"
+                    f"📊 **Note:** Dailymotion may take a few minutes to process HD quality.\n"
+                    f"🔍 **Privacy:** Video is set to public by default."
                 )
                 
-                # Send clickable link
+                await progress_message.edit_text(success_text)
+                
+                # Send clickable link as separate message
                 keyboard = [[InlineKeyboardButton("🎬 Watch on Dailymotion", url=video_url)]]
                 await client.send_message(
                     user_id,
-                    f"🎬 **Quick Access**\n\nClick below to watch your video:",
+                    f"🎬 **Quick Access Link**\n\nClick the button below to watch your video on Dailymotion:",
                     reply_markup=InlineKeyboardMarkup(keyboard)
                 )
                 
@@ -1167,28 +1325,35 @@ async def handle_upload_callback(client, callback_query: CallbackQuery, channel_
                     f"📺 **Channel:** {channel['channel_name']}\n\n"
                     f"**Diagnostic Results:**\n{error_details}\n\n"
                     f"**Troubleshooting Steps:**\n"
-                    f"1. Use /testauth to verify credentials\n"
-                    f"2. Use /testapi to check connectivity\n"
-                    f"3. Try with a smaller file first\n"
-                    f"4. Check if account is active on Dailymotion\n"
-                    f"5. Verify file format is supported\n\n"
+                    f"1️⃣ Use /testauth to verify credentials\n"
+                    f"2️⃣ Use /testapi to check connectivity\n"
+                    f"3️⃣ Try with a smaller file (under 100MB)\n"
+                    f"4️⃣ Ensure account is active on Dailymotion\n"
+                    f"5️⃣ Verify file format is supported\n"
+                    f"6️⃣ Check if API application is approved\n\n"
                     f"💡 **Quick Tests:**\n"
-                    f"• /testauth - Test your credentials\n"
-                    f"• /testapi - Test API connectivity"
+                    f"• /testauth - Test credentials\n"
+                    f"• /testapi - Test connectivity"
                 )
             
         except asyncio.CancelledError:
+            try:
+                os.unlink(temp_file_path)
+            except:
+                pass
             await progress_message.edit_text(
                 f"❌ **Upload Cancelled!**\n\n"
-                f"The upload process was cancelled due to timeout or connection issues.\n\n"
+                f"The upload process was cancelled or timed out.\n\n"
                 f"**Possible causes:**\n"
-                f"• Network timeout\n"
-                f"• File too large for connection\n"
-                f"• Server overload\n\n"
+                f"• Network timeout or disconnection\n"
+                f"• File too large for your connection speed\n"
+                f"• Dailymotion server overload\n"
+                f"• Process took longer than 15 minutes\n\n"
                 f"**Solutions:**\n"
-                f"• Try again with stable internet\n"
-                f"• Use smaller file size\n"
-                f"• Try during off-peak hours"
+                f"• Ensure stable internet connection\n"
+                f"• Try with smaller file size\n"
+                f"• Upload during off-peak hours\n"
+                f"• Compress video before uploading"
             )
         except Exception as e:
             logger.error(f"Upload process error: {e}")
@@ -1203,15 +1368,16 @@ async def handle_upload_callback(client, callback_query: CallbackQuery, channel_
                 f"❌ **Upload Error!**\n\n"
                 f"📁 **File:** {file_name}\n"
                 f"📺 **Channel:** {channel['channel_name']}\n\n"
-                f"**Error Details:** {str(e)[:200]}...\n\n"
+                f"**Error Details:** {str(e)[:200]}{'...' if len(str(e)) > 200 else ''}\n\n"
                 f"**Diagnostic Commands:**\n"
                 f"• /testauth - Test credentials\n"
                 f"• /testapi - Test connectivity\n\n"
                 f"**Common Solutions:**\n"
-                f"• Check internet connection\n"
-                f"• Verify file is not corrupted\n"
+                f"• Check internet connection stability\n"
+                f"• Verify file isn't corrupted\n"
                 f"• Try with smaller file first\n"
-                f"• Ensure Dailymotion account is active"
+                f"• Ensure Dailymotion account is active\n"
+                f"• Check API application approval status"
             )
         
         # Clean up user state
@@ -1221,15 +1387,22 @@ async def handle_upload_callback(client, callback_query: CallbackQuery, channel_
     except Exception as e:
         logger.error(f"Upload callback error: {e}")
         logger.error(f"Traceback: {traceback.format_exc()}")
-        await callback_query.edit_message_text(
-            "❌ **Critical Error!**\n\n"
-            "An unexpected error occurred during upload.\n\n"
-            "**Immediate Steps:**\n"
-            "1. Try /testauth to check credentials\n"
-            "2. Try /testapi to check connectivity\n"
-            "3. Try again with a smaller file\n"
-            "4. Contact support if issue persists"
-        )
+        try:
+            await callback_query.edit_message_text(
+                "❌ **Critical Error!**\n\n"
+                "An unexpected error occurred during upload.\n\n"
+                "**Immediate Steps:**\n"
+                "1️⃣ Try /testauth to check credentials\n"
+                "2️⃣ Try /testapi to check connectivity\n"
+                "3️⃣ Try again with a smaller file\n"
+                "4️⃣ Restart the process with /upload\n\n"
+                "If the problem persists, there may be an issue with:\n"
+                "• Your API credentials or account status\n"
+                "• Network connectivity\n"
+                "• Dailymotion API temporary issues"
+            )
+        except:
+            logger.error("Could not edit callback message")
 
 async def handle_remove_callback(client, callback_query: CallbackQuery, channel_id: int):
     user_id = callback_query.from_user.id
@@ -1264,7 +1437,8 @@ async def handle_remove_callback(client, callback_query: CallbackQuery, channel_
                 f"📺 **Channel:** {channel['channel_name']}\n"
                 f"👤 **Username:** @{channel['username']}\n\n"
                 f"The channel and all its credentials have been permanently deleted from our database.\n\n"
-                f"💡 You can add it back anytime using /addchannel"
+                f"🔒 **Security:** All stored credentials have been wiped.\n"
+                f"💡 **Note:** You can add it back anytime using /addchannel"
             )
         else:
             await callback_query.edit_message_text("❌ Channel could not be removed. It may have been already deleted.")
@@ -1274,81 +1448,111 @@ async def handle_remove_callback(client, callback_query: CallbackQuery, channel_
         await callback_query.edit_message_text("❌ Error removing channel. Please try again later.")
 
 async def update_download_progress(message, current, total, file_name, channel_name):
+    """Update download progress with rate limiting to avoid API limits"""
     try:
         percent = int((current / total) * 100)
         progress_bar = "█" * (percent // 5) + "░" * (20 - percent // 5)
         current_mb = current / (1024 * 1024)
         total_mb = total / (1024 * 1024)
         
-        # Calculate speed (rough estimate)
+        # Calculate download speed
         speed_text = ""
-        if hasattr(update_download_progress, 'last_time') and hasattr(update_download_progress, 'last_current'):
-            import time
-            current_time = time.time()
-            time_diff = current_time - update_download_progress.last_time
-            if time_diff > 2:  # Update every 2 seconds to avoid rate limits
-                bytes_diff = current - update_download_progress.last_current
-                speed_mbps = (bytes_diff / time_diff) / (1024 * 1024)
-                speed_text = f"📡 **Speed:** {speed_mbps:.1f} MB/s\n"
-                update_download_progress.last_time = current_time
-                update_download_progress.last_current = current
-        else:
-            import time
-            update_download_progress.last_time = time.time()
-            update_download_progress.last_current = current
+        current_time = asyncio.get_event_loop().time()
         
-        if percent % 10 == 0 or percent >= 95:  # Update every 10% or near completion
+        if not hasattr(update_download_progress, 'last_update'):
+            update_download_progress.last_update = current_time
+            update_download_progress.last_current = current
+            return
+        
+        time_diff = current_time - update_download_progress.last_update
+        
+        # Update every 3 seconds or on significant progress changes to avoid rate limits
+        if time_diff >= 3 or percent >= 95 or percent % 20 == 0:
+            bytes_diff = current - update_download_progress.last_current
+            if time_diff > 0:
+                speed_mbps = (bytes_diff / time_diff) / (1024 * 1024)
+                if speed_mbps > 0:
+                    speed_text = f"📡 **Speed:** {speed_mbps:.1f} MB/s\n"
+            
+            # Calculate ETA
+            eta_text = ""
+            if speed_mbps > 0 and current < total:
+                remaining_mb = (total - current) / (1024 * 1024)
+                eta_seconds = remaining_mb / speed_mbps
+                if eta_seconds < 60:
+                    eta_text = f"⏱️ **ETA:** {int(eta_seconds)}s\n"
+                elif eta_seconds < 3600:
+                    eta_text = f"⏱️ **ETA:** {int(eta_seconds/60)}m {int(eta_seconds%60)}s\n"
+            
             await message.edit_text(
-                f"⬇️ **Downloading Video...**\n\n"
+                f"⬇️ **Downloading from Telegram...**\n\n"
                 f"📁 **File:** {file_name}\n"
                 f"📺 **Channel:** {channel_name}\n\n"
                 f"📊 **Progress:** {percent}%\n"
                 f"[{progress_bar}]\n"
                 f"📦 **Downloaded:** {current_mb:.1f} MB / {total_mb:.1f} MB\n"
                 f"{speed_text}"
-                f"⏳ Please wait... Do not close the app!"
+                f"{eta_text}"
+                f"⏳ **Please wait...** Do not close the app!"
             )
-    except Exception:
-        # Ignore message edit errors (rate limiting, etc.)
+            
+            update_download_progress.last_update = current_time
+            update_download_progress.last_current = current
+            
+    except Exception as e:
+        # Ignore message edit errors (rate limiting, network issues, etc.)
+        logger.debug(f"Download progress update error (ignored): {e}")
         pass
 
 async def update_upload_progress(message, progress_percent, file_name, channel_name):
+    """Update upload progress with detailed status information"""
     try:
         progress_bar = "█" * (progress_percent // 5) + "░" * (20 - progress_percent // 5)
         
-        status_text = ""
-        if progress_percent < 25:
-            status_text = "🔐 Authenticating with Dailymotion..."
-        elif progress_percent < 50:
-            status_text = "📤 Uploading file to servers..."
-        elif progress_percent < 75:
-            status_text = "⚙️ Processing video metadata..."
-        elif progress_percent < 100:
-            status_text = "🎬 Creating video entry..."
+        # Detailed status based on progress
+        if progress_percent < 10:
+            status_text = "🔐 Authenticating with Dailymotion API..."
+            step = "1/5"
+        elif progress_percent < 20:
+            status_text = "📤 Getting upload URL from Dailymotion..."
+            step = "2/5"
+        elif progress_percent < 80:
+            status_text = "⬆️ Uploading file to Dailymotion servers..."
+            step = "3/5"
+        elif progress_percent < 95:
+            status_text = "⚙️ Processing video metadata and thumbnails..."
+            step = "4/5"
         else:
-            status_text = "✅ Upload complete!"
+            status_text = "🎬 Creating video entry and finalizing..."
+            step = "5/5"
         
-        # Only update on significant progress changes
-        if progress_percent % 25 == 0 or progress_percent >= 95:
+        # Only update on significant progress changes to avoid rate limits
+        if not hasattr(update_upload_progress, 'last_percent'):
+            update_upload_progress.last_percent = 0
+        
+        percent_diff = abs(progress_percent - update_upload_progress.last_percent)
+        
+        if percent_diff >= 15 or progress_percent >= 95 or progress_percent <= 5:
             await message.edit_text(
                 f"⬆️ **Uploading to Dailymotion...**\n\n"
                 f"📁 **File:** {file_name}\n"
                 f"📺 **Channel:** {channel_name}\n\n"
-                f"📊 **Progress:** {progress_percent}%\n"
+                f"📊 **Progress:** {progress_percent}% ({step})\n"
                 f"[{progress_bar}]\n"
                 f"🔄 **Status:** {status_text}\n\n"
-                f"⏳ Please be patient... Large files take longer!"
+                f"⏳ **Please be patient...** Large files take longer!\n"
+                f"🚫 **Do not close the app** until upload completes."
             )
-    except Exception:
+            update_upload_progress.last_percent = progress_percent
+            
+    except Exception as e:
         # Ignore message edit errors
+        logger.debug(f"Upload progress update error (ignored): {e}")
         pass
 
 def signal_handler(signum, frame):
     """Handle shutdown signals gracefully"""
     logger.info(f"Received signal {signum}, shutting down gracefully...")
-    global health_server
-    if health_server:
-        health_server.shutdown()
     sys.exit(0)
 
 if __name__ == "__main__":
@@ -1357,25 +1561,31 @@ if __name__ == "__main__":
     signal.signal(signal.SIGINT, signal_handler)
     
     try:
-        # Start health check server
-        health_server = start_health_server()
-        
         # Initialize database
         init_db()
         
         # Start bot
         logger.info("🚀 Dailymotion Upload Bot starting...")
-        logger.info(f"Bot token: {BOT_TOKEN[:10]}...")
-        logger.info("Available commands: /start, /help, /addchannel, /upload, /list, /rmchannel, /testauth, /testapi")
+        logger.info("📋 Available commands: /start, /help, /addchannel, /upload, /list, /rmchannel, /testauth, /testapi")
+        logger.info("🔗 API Endpoints: https://www.dailymotion.com/api")
+        logger.info("🔐 OAuth Endpoint: https://www.dailymotion.com/oauth")
+        
+        # Verify environment variables
+        if not all([API_ID, API_HASH, BOT_TOKEN, DATABASE_URL]):
+            logger.error("❌ Missing required environment variables!")
+            logger.error("Required: API_ID, API_HASH, BOT_TOKEN, DATABASE_URL")
+            sys.exit(1)
+        
+        logger.info("✅ All environment variables present")
+        logger.info("🔄 Starting Pyrogram client...")
         
         app.run()
         
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
+        logger.info("🛑 Bot stopped by user (Ctrl+C)")
     except Exception as e:
-        logger.error(f"Bot crashed: {e}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        logger.error(f"💥 Bot crashed: {e}")
+        logger.error(f"📋 Traceback: {traceback.format_exc()}")
+        sys.exit(1)
     finally:
-        if health_server:
-            health_server.shutdown()
-        logger.info("Bot shutdown complete")
+        logger.info("🔚 Bot shutdown complete")
