@@ -117,7 +117,7 @@ class DailymotionUploader:
         self.username = username
         self.password = password
         self.access_token = None
-        self.base_url = "https://api.dailymotion.com"
+        self.base_url = "https://partner.api.dailymotion.com"  # Partner API endpoint
         self.session = None
     
     async def get_session(self):
@@ -132,20 +132,20 @@ class DailymotionUploader:
             await self.session.close()
     
     async def authenticate(self):
-        """Enhanced authentication with detailed error reporting"""
+        """Authenticate with Dailymotion Partner API"""
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                logger.info(f"Authentication attempt {attempt + 1}/{max_retries}")
+                logger.info(f"Partner API authentication attempt {attempt + 1}/{max_retries}")
                 
-                auth_url = f"{self.base_url}/oauth/token"
+                auth_url = f"{self.base_url}/oauth/v2/token"  # Partner API OAuth endpoint
                 data = {
                     'grant_type': 'password',
                     'client_id': self.api_key,
                     'client_secret': self.api_secret,
                     'username': self.username,
                     'password': self.password,
-                    'scope': 'manage_videos'
+                    'scope': 'manage_videos manage_channels'  # Partner-specific scopes
                 }
                 
                 session = await self.get_session()
@@ -158,56 +158,56 @@ class DailymotionUploader:
                         result = await response.json()
                         self.access_token = result.get('access_token')
                         if self.access_token:
-                            logger.info("Authentication successful")
+                            logger.info("Partner API authentication successful")
                             return True
                         else:
-                            logger.error("No access token in response")
+                            logger.error("No access token in Partner API response")
                     else:
-                        logger.error(f"Authentication failed: {response.status} - {response_text}")
+                        logger.error(f"Partner API authentication failed: {response.status} - {response_text}")
                         
                         if response.status == 400:
-                            logger.error("Bad request - check credentials format")
+                            logger.error("Bad request - check API key/secret format")
                         elif response.status == 401:
                             logger.error("Unauthorized - invalid username/password")
                         elif response.status == 403:
-                            logger.error("Forbidden - account may be suspended")
+                            logger.error("Forbidden - account may be restricted or not a Partner Account")
                         elif response.status >= 500:
-                            logger.error("Server error - Dailymotion service issue")
+                            logger.error("Server error - Partner API service issue")
                         
                         if attempt < max_retries - 1:
                             await asyncio.sleep(2 ** attempt)
                         
             except asyncio.TimeoutError:
-                logger.error(f"Authentication timeout (attempt {attempt + 1})")
+                logger.error(f"Partner API authentication timeout (attempt {attempt + 1})")
                 if attempt < max_retries - 1:
                     await asyncio.sleep(2 ** attempt)
             except Exception as e:
-                logger.error(f"Authentication error (attempt {attempt + 1}): {e}")
+                logger.error(f"Partner API authentication error (attempt {attempt + 1}): {e}")
                 if attempt < max_retries - 1:
                     await asyncio.sleep(2 ** attempt)
         
         return False
     
     async def upload_video(self, file_path, title, description="", tags="", progress_callback=None):
-        """Enhanced upload with better error reporting"""
+        """Upload video to Dailymotion Partner API"""
         try:
             logger.info(f"Starting upload for file: {file_path}")
             logger.info(f"File size: {os.path.getsize(file_path)} bytes")
             
-            # Validate file first
+            # Validate file
             is_valid, validation_msg = validate_video_file(file_path)
             if not is_valid:
                 logger.error(f"File validation failed: {validation_msg}")
                 return None
             
             if not self.access_token:
-                logger.info("No access token, authenticating...")
+                logger.info("No access token, authenticating with Partner API...")
                 if not await self.authenticate():
-                    logger.error("Authentication failed, cannot upload")
+                    logger.error("Partner API authentication failed, cannot upload")
                     return None
             
             # Step 1: Get upload URL
-            logger.info("Step 1: Getting upload URL")
+            logger.info("Step 1: Getting Partner API upload URL")
             upload_url_endpoint = f"{self.base_url}/file/upload"
             params = {'access_token': self.access_token}
             
@@ -225,33 +225,33 @@ class DailymotionUploader:
                             upload_data = await response.json()
                             upload_url = upload_data.get('upload_url')
                             if upload_url:
-                                logger.info(f"Got upload URL successfully")
+                                logger.info(f"Got Partner API upload URL successfully")
                                 break
                             else:
-                                logger.error("No upload URL in response")
+                                logger.error("No upload URL in Partner API response")
                         elif response.status == 401:
-                            logger.info("Token expired, re-authenticating...")
+                            logger.info("Partner API token expired, re-authenticating...")
                             if await self.authenticate():
                                 params['access_token'] = self.access_token
                                 continue
                             else:
-                                logger.error("Re-authentication failed")
+                                logger.error("Partner API re-authentication failed")
                                 return None
                         else:
-                            logger.error(f"Failed to get upload URL: {response.status} - {response_text}")
+                            logger.error(f"Failed to get Partner API upload URL: {response.status} - {response_text}")
                             
                 except Exception as e:
-                    logger.error(f"Upload URL request error: {e}")
+                    logger.error(f"Partner API upload URL request error: {e}")
                 
                 if attempt < 2:
                     await asyncio.sleep(2 ** attempt)
             
             if not upload_url:
-                logger.error("Could not get upload URL after all attempts")
+                logger.error("Could not get Partner API upload URL after all attempts")
                 return None
             
             # Step 2: Upload file
-            logger.info("Step 2: Uploading file")
+            logger.info("Step 2: Uploading file to Partner API")
             file_size = os.path.getsize(file_path)
             
             async with aiofiles.open(file_path, 'rb') as file:
@@ -264,7 +264,7 @@ class DailymotionUploader:
                 file_url = None
                 for attempt in range(3):
                     try:
-                        logger.info(f"File upload attempt {attempt + 1}")
+                        logger.info(f"Partner API file upload attempt {attempt + 1}")
                         
                         data = aiohttp.FormData()
                         data.add_field('file', file_content, 
@@ -276,50 +276,50 @@ class DailymotionUploader:
                         
                         async with session.post(upload_url, data=data) as response:
                             response_text = await response.text()
-                            logger.info(f"File upload response status: {response.status}")
+                            logger.info(f"Partner API file upload response status: {response.status}")
                             
                             if response.status == 200:
                                 upload_result = await response.json()
                                 file_url = upload_result.get('url')
                                 if file_url:
-                                    logger.info(f"File uploaded successfully")
+                                    logger.info(f"File uploaded successfully to Partner API")
                                     break
                                 else:
-                                    logger.error("No file URL in upload response")
+                                    logger.error("No file URL in Partner API upload response")
                             else:
-                                logger.error(f"File upload failed: {response.status} - {response_text}")
+                                logger.error(f"Partner API file upload failed: {response.status} - {response_text}")
                                 
                     except Exception as e:
-                        logger.error(f"File upload error: {e}")
+                        logger.error(f"Partner API file upload error: {e}")
                         
                     if attempt < 2:
                         await asyncio.sleep(2 ** attempt)
                 
                 if not file_url:
-                    logger.error("File upload failed after all attempts")
+                    logger.error("Partner API file upload failed after all attempts")
                     return None
             
             if progress_callback:
                 await progress_callback(75)
             
             # Step 3: Create video
-            logger.info("Step 3: Creating video entry")
-            create_url = f"{self.base_url}/me/videos"
+            logger.info("Step 3: Creating video entry in Partner API")
+            create_url = f"{self.base_url}/videos"  # Partner API video creation endpoint
             video_data = {
                 'access_token': self.access_token,
                 'url': file_url,
                 'title': title,
                 'description': description,
                 'tags': tags,
-                'published': 'true'
+                'is_public': 'true'  # Partner API uses is_public instead of published
             }
             
             for attempt in range(3):
                 try:
-                    logger.info(f"Video creation attempt {attempt + 1}")
+                    logger.info(f"Partner API video creation attempt {attempt + 1}")
                     async with session.post(create_url, data=video_data) as response:
                         response_text = await response.text()
-                        logger.info(f"Video creation response status: {response.status}")
+                        logger.info(f"Partner API video creation response status: {response.status}")
                         
                         if response.status == 200:
                             result = await response.json()
@@ -333,29 +333,29 @@ class DailymotionUploader:
                                 
                                 return video_url
                             else:
-                                logger.error("No video ID in creation response")
+                                logger.error("No video ID in Partner API creation response")
                         elif response.status == 401:
-                            logger.info("Token expired during video creation")
+                            logger.info("Partner API token expired during video creation")
                             if await self.authenticate():
                                 video_data['access_token'] = self.access_token
                                 continue
                             else:
-                                logger.error("Re-authentication failed during video creation")
+                                logger.error("Partner API re-authentication failed during video creation")
                                 return None
                         else:
-                            logger.error(f"Video creation failed: {response.status} - {response_text}")
+                            logger.error(f"Partner API video creation failed: {response.status} - {response_text}")
                             
                 except Exception as e:
-                    logger.error(f"Video creation error: {e}")
+                    logger.error(f"Partner API video creation error: {e}")
                 
                 if attempt < 2:
                     await asyncio.sleep(2 ** attempt)
             
-            logger.error("Video creation failed after all attempts")
+            logger.error("Partner API video creation failed after all attempts")
             return None
                     
         except Exception as e:
-            logger.error(f"Upload error: {e}")
+            logger.error(f"Partner API upload error: {e}")
             logger.error(f"Traceback: {traceback.format_exc()}")
             return None
         finally:
@@ -384,11 +384,11 @@ async def get_upload_error_details(uploader, file_path):
     # Test network connectivity
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get("https://api.dailymotion.com/", timeout=aiohttp.ClientTimeout(total=10)) as response:
+            async with session.get("https://partner.api.dailymotion.com/", timeout=aiohttp.ClientTimeout(total=10)) as response:
                 if response.status == 200:
-                    details.append("✅ Dailymotion API accessible")
+                    details.append("✅ Dailymotion Partner API accessible")
                 else:
-                    details.append(f"❌ Dailymotion API error: {response.status}")
+                    details.append(f"❌ Dailymotion Partner API error: {response.status}")
     except asyncio.TimeoutError:
         details.append("❌ Network timeout - check internet connection")
     except Exception as e:
@@ -457,11 +457,11 @@ async def help_command(client, message: Message):
 ⏱️ Upload time depends on file size and internet speed
 
 **Getting API Credentials:**
-1. Go to https://api.dailymotion.com
-2. Create a developer account
+1. Go to https://partner.api.dailymotion.com
+2. Log in to your Partner Dashboard
 3. Register your application
 4. Get your API Key and Secret
-5. Use your Dailymotion username/password
+5. Use your Dailymotion Partner username/password
 
 **Troubleshooting:**
 If uploads fail, try:
@@ -469,7 +469,7 @@ If uploads fail, try:
 • Test connectivity with /testapi
 • Try smaller files first
 • Check your internet connection
-• Verify Dailymotion account is active
+• Verify Dailymotion Partner account is active
 
 Need more help? Use the debug commands to diagnose issues!
     """
@@ -533,14 +533,14 @@ async def test_auth_command(client, message: Message):
 # Debug command to test API connectivity
 @app.on_message(filters.command("testapi"))
 async def test_api_command(client, message: Message):
-    """Test Dailymotion API connectivity"""
-    testing_msg = await message.reply_text("🌐 **Testing API Connectivity...**\n\nChecking Dailymotion API access...")
+    """Test Dailymotion Partner API connectivity"""
+    testing_msg = await message.reply_text("🌐 **Testing API Connectivity...**\n\nChecking Dailymotion Partner API access...")
     
     try:
         # Test basic API connectivity
         async with aiohttp.ClientSession() as session:
             start_time = asyncio.get_event_loop().time()
-            async with session.get("https://api.dailymotion.com/", timeout=aiohttp.ClientTimeout(total=10)) as response:
+            async with session.get("https://partner.api.dailymotion.com/", timeout=aiohttp.ClientTimeout(total=10)) as response:
                 end_time = asyncio.get_event_loop().time()
                 response_time = int((end_time - start_time) * 1000)
                 
@@ -549,7 +549,7 @@ async def test_api_command(client, message: Message):
                 if status == 200:
                     result_text = (
                         f"✅ **API Connectivity Test Passed!**\n\n"
-                        f"🌐 **Endpoint:** https://api.dailymotion.com/\n"
+                        f"🌐 **Endpoint:** https://partner.api.dailymotion.com/\n"
                         f"📊 **Status Code:** {status}\n"
                         f"⏱️ **Response Time:** {response_time}ms\n\n"
                         f"🔗 **Network:** Working properly\n"
@@ -559,10 +559,10 @@ async def test_api_command(client, message: Message):
                 else:
                     result_text = (
                         f"⚠️ **API Connectivity Issues**\n\n"
-                        f"🌐 **Endpoint:** https://api.dailymotion.com/\n"
+                        f"🌐 **Endpoint:** https://partner.api.dailymotion.com/\n"
                         f"📊 **Status Code:** {status}\n"
                         f"⏱️ **Response Time:** {response_time}ms\n\n"
-                        f"The API is reachable but returned an unexpected status code."
+                        f"The Partner API is reachable but returned an unexpected status code."
                     )
                 
         await testing_msg.edit_text(result_text)
@@ -575,7 +575,7 @@ async def test_api_command(client, message: Message):
             "**Possible causes:**\n"
             "• Slow internet connection\n"
             "• Network firewall blocking access\n"
-            "• Dailymotion API temporarily down\n"
+            "• Dailymotion Partner API temporarily down\n"
             "• ISP blocking Dailymotion\n\n"
             "**Solutions:**\n"
             "• Check your internet connection\n"
@@ -715,7 +715,7 @@ async def upload_command(client, message: Message):
                 "You need to add at least one Dailymotion account before uploading.\n\n"
                 "🔧 **Steps to get started:**\n"
                 "1. Use /addchannel to add your Dailymotion account\n"
-                "2. Get your API credentials from https://api.dailymotion.com\n"
+                "2. Get your API credentials from https://partner.api.dailymotion.com\n"
                 "3. Come back and use /upload\n\n"
                 "🔍 **Troubleshooting:**\n"
                 "• Use /testauth to verify credentials\n"
@@ -762,7 +762,7 @@ async def handle_text_messages(client, message: Message):
         state["step"] = "api_key"
         await message.reply_text(
             "**Step 2/5:** Please enter your Dailymotion API Key:\n\n"
-            "💡 *Get it from: https://api.dailymotion.com*"
+            "💡 *Get it from: https://partner.api.dailymotion.com*"
         )
     
     elif state["step"] == "api_key":
@@ -840,7 +840,7 @@ async def handle_text_messages(client, message: Message):
                 "• Incorrect username or password\n"
                 "• Invalid API key or secret\n"
                 "• Account suspended or restricted\n"
-                "• Dailymotion service temporarily unavailable\n\n"
+                "• Dailymotion Partner service temporarily unavailable\n\n"
                 "**Solutions:**\n"
                 "• Double-check all credentials\n"
                 "• Verify account is active on Dailymotion\n"
